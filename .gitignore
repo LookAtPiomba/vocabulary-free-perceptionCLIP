@@ -1,6 +1,8 @@
 .idea
 scripts_internal
 replicate_runs_internal
+datasets
+slurm*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
