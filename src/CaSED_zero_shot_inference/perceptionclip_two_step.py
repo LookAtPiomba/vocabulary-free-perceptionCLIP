@@ -442,12 +442,12 @@ def evaluate_accuracy(model, text_sim_model, dataset, template_list, args):
             # evaluate accuracy
             sim += sum([sentence_similarity(text_sim_model, pred[i], ground_truth[i]) for i in range(len(pred))])
             print(f"Accuracy: {(sim / n)*100}%, batch: {i+1}/{len(dataloader)}")
-            end = time.time()
-            break
-            if (end-start) > 43200:
+            
+            '''if (end-start) > 43200:
                 print(f"Time: {end-start}")
                 print(f"terminated at batch: {i+1}/{len(dataloader)}")
-                break
+                break'''
+        end = time.time()
         print(f"Time: {(end-start)/60} minutes")
         acc = sim / n
     return acc
