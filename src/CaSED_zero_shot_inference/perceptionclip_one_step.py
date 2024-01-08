@@ -1,13 +1,22 @@
 import torch
 import argparse
 import csv
-import os
+import os, time
+from itertools import chain
 import src.datasets as datasets
 import src.templates as templates
 from src.datasets.common import get_dataloader, maybe_dictionarize
 from src.zero_shot_inference.utils import *
 from src.models import utils
 from src.models.modeling import CLIPEncoder
+from transformers import AutoModel, CLIPProcessor
+from sentence_transformers import SentenceTransformer, util
+import numpy as np
+import torchvision.transforms as T
+import torchvision.transforms.functional as TF
+from PIL import Image
+from src.datasets.imagenet_classnames import get_classnames
+from torchvision.utils import save_image
 
 
 def parse_arguments():
@@ -100,7 +109,7 @@ def parse_arguments():
     parser.add_argument(
         "--save_path",
         type=str,
-        default='./results/zero_shot_inference/eval_acc_ours',
+        default='./results/CaSED_zero_shot_inference/eval_acc_ours',
         help="Name of the csv",
     )
     parser.add_argument(
@@ -160,7 +169,7 @@ def parse_arguments():
 
 def main(args):
     # load model
-    model = CLIPEncoder(args, keep_lang=True)
+    '''model = CLIPEncoder(args, keep_lang=True)
     print(f"Model arch: {args.model}")
     if args.finetuned_checkpoint is not None:
         if args.checkpoint_mode == 0:
@@ -169,27 +178,59 @@ def main(args):
         elif args.checkpoint_mode == 1:
             model.load(args.finetuned_checkpoint)
         print('finetuned model loaded.')
-    model = model.cuda()
+    #model = model.cuda()'''
+        
+    # create image transformer
+    preprocess = T.transforms.Compose([
+        T.Resize((224, 224)),
+        T.ToTensor(),
+    ])
 
     # load data
     dataset_class = getattr(datasets, args.dataset)
-    dataset = dataset_class(model.val_preprocess,
+    dataset = dataset_class(preprocess,
                             location=args.data_location,
                             batch_size=args.batch_size,
                             num_workers=args.workers)
     print(f"Eval dataset: {args.dataset}")
 
-    # load template
-    template_list = getattr(templates, args.template)
+    #model = None
 
-    # create classifier
-    classification_head = get_zeroshot_classifier(args, model.model, dataset.classnames, template_list)
-    classification_head = classification_head.cuda()
+    # load template
+    if args.template != "no_template":
+        template_list = getattr(templates, args.template)
+        template = template_list[0]
+        print(f"template: {template('test')}")
+    else:
+        template = None
+        print("Standard CaSED")
+
+    # get classifier
+    cased = AutoModel.from_pretrained("altndrr/cased", trust_remote_code=True)
+    cased = cased.cuda()
+    cased._old_processor = cased.processor
+
+    if args.template != "no_template":
+        def text_processor(self, text, template=template, **kwargs):
+            formatted_text = [template(t) for t in text]
+
+            return self._old_processor(text=formatted_text, **kwargs)
+
+        cased.processor = text_processor.__get__(cased)
+
+
+    # get sentence-BERT model
+    sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
+    sbert_model.cuda()
 
     if args.eval_group:
-        acc, worst, _ = classify(model, classification_head, dataset, args)
+        #acc, worst, _ = classify(model, classification_head, dataset, args, factor_head)
+        pass
     else:
-        acc = classify(model, classification_head, dataset, args)
+        #acc = classify(model, classification_head, dataset, args, factor_head)
+        acc = evaluate_accuracy(cased, sbert_model, dataset, args)
+    
+    print(f"Avg accuracy: {acc}")
 
     # save result to csv
     if not os.path.exists(args.save_path):
@@ -204,17 +245,17 @@ def main(args):
             writer.writerow([args.eval_augmentation] + [acc])
         else:
             if args.eval_group:
-                writer.writerow([args.template] + [acc] + [worst])
+                #writer.writerow([args.template] + [acc] + [worst])
+                pass
             else:
                 writer.writerow([args.template] + [acc])
     print('results saved!')
 
     return
 
+def evaluate_accuracy(model, text_sim_model, dataset, args):
 
-def classify(model, classification_head, dataset, args):
     model.eval()
-    classification_head.eval()
     dataloader = get_dataloader(dataset,
                                 is_train=args.eval_trainset,
                                 args=args,
@@ -222,42 +263,50 @@ def classify(model, classification_head, dataset, args):
     batched_data = enumerate(dataloader)
     device = args.device
 
-    if args.eval_group:
-        group_correct = torch.zeros((args.num_attrs, args.num_labels))
-        group_cnt = torch.zeros((args.num_attrs, args.num_labels))
-    else:
-        top1, correct, n = 0., 0., 0.
+    classnames = get_classnames('openai') if 'ImageNet' in args.dataset else dataset.classnames
 
     with torch.no_grad():
-
+        acc, sim, n = 0., 0., 0.
+        start = time.time()
         for i, data in batched_data:
+            
             data = maybe_dictionarize(data)
             x = data['images'].to(device)
             y = data['labels'].to(device)
-            if args.eval_group:
-                a = data['metadata'].to(device)
+            
+            n += len(x)
+            
+            # classify
+            pred = classify_batch(model, x)
 
-            logits = utils.get_logits(x, model, classification_head)
-            pred = logits.argmax(dim=1, keepdim=True).to(device)
+            # evaluate accuracy
+            y = [classnames[yi] for yi in y]          
+            sim += sum([sentence_similarity(text_sim_model, pred[i], y[i]) for i in range(len(pred))])
+            print(f"Accuracy: {(sim / n)*100}%, batch: {i+1}/{len(dataloader)}")
 
-            if args.eval_group:
-                batch_group_correct, batch_group_cnt = group_accuracy(args, pred, y, a)
-                group_correct += batch_group_correct
-                group_cnt += batch_group_cnt
-            else:
-                correct += pred.eq(y.view_as(pred)).sum().item()
-                n += y.size(0)
+        end = time.time()
+        print(f"Time: {(end-start)/60} minutes")
+        acc = sim / n
+    return acc
 
-    if args.eval_group:
-        acc = group_correct.sum() / group_cnt.sum() * 100
-        group_acc = torch.nan_to_num(group_correct / group_cnt) * 100
-        worst_acc = group_acc.min()
-        print(f"Avg Accuracy: {acc.item():.2f} | Worst Accuracy: {worst_acc.item():.2f} | Group Acc: {group_acc.tolist()}")
-        return acc.item(), worst_acc.item(), group_acc.tolist()
-    else:
-        top1 = correct / n
-        print(f"Accuracy: {top1}")
-        return top1
+def sentence_similarity(text_sim_model, predicted, ground_truth):
+
+    predicted_embeddings = text_sim_model.encode(predicted, convert_to_tensor=True)
+    ground_truth_embeddings = text_sim_model.encode(ground_truth, convert_to_tensor=True)
+
+    similarity_score = util.pytorch_cos_sim(predicted_embeddings, ground_truth_embeddings)
+
+    return similarity_score.item()
+
+def classify_batch(model, images):
+    '''images = [torch.clamp(xi, 0, 1) for xi in images]'''
+    images = [T.ToPILImage()(xi) for xi in images]
+    images = model._old_processor(images=images, return_tensors="pt", padding=True)
+    outputs = model(images, alpha=0.7)
+    labels = list(chain(*outputs["vocabularies"]))
+    pred = [labels[scores.argmax().item()] for scores in outputs["scores"]]
+
+    return pred
 
 
 if __name__ == '__main__':

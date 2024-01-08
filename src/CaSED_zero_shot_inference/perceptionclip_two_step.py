@@ -66,7 +66,7 @@ def parse_arguments():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=128,
+        default=32,
     )
     parser.add_argument("--workers",
                         type=int,
@@ -187,7 +187,7 @@ def parse_arguments():
 
 
 def main(args):
-    # load model
+    '''# load model
     model = CLIPEncoder(args, keep_lang=True)
     print(f"Model arch: {args.model}")
     if args.finetuned_checkpoint is not None:
@@ -197,18 +197,23 @@ def main(args):
         elif args.checkpoint_mode == 1:
             model.load(args.finetuned_checkpoint)
         print('finetuned model loaded.')
-    #model = model.cuda()
+    #model = model.cuda()'''
+
+    # create image transformer
+    preprocess = T.transforms.Compose([
+        T.Resize((224, 224)),
+        T.ToTensor(),
+    ])
 
     # load data
     dataset_class = getattr(datasets, args.dataset)
-    dataset = dataset_class(model.val_preprocess,
+    dataset = dataset_class(preprocess,
                             location=args.data_location,
                             batch_size=args.batch_size,
                             num_workers=args.workers)
     print(f"Eval dataset: {args.dataset}")
 
-    model.eval()
-    del model
+    #model = None
 
     # load template
     if args.factors is not None:
@@ -317,8 +322,8 @@ def main(args):
             vocabularies = self.get_vocabulary(images_z=images_z)
 
             # encode unfiltered words
-            unfiltered_words = vocabularies[:]
-            texts_z = self.processor(unfiltered_words, return_tensors="pt", padding=True)
+            unfiltered_words = sum(vocabularies, [])
+            texts_z = self._old_processor(unfiltered_words, return_tensors="pt", padding=True)
             texts_z["input_ids"] = texts_z["input_ids"][:, :77].to(self.device)
             texts_z["attention_mask"] = texts_z["attention_mask"][:, :77].to(self.device)
             texts_z = self.language_encoder(**texts_z)[1]
@@ -373,7 +378,7 @@ def main(args):
         cased.forward = forward.__get__(cased)
 
     # get sentence-BERT model
-    sbert_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+    sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
     sbert_model.cuda()
 
     if args.eval_group:
@@ -423,7 +428,7 @@ def evaluate_accuracy(model, text_sim_model, dataset, template_list, args):
     batched_data = enumerate(dataloader)
     device = args.device
 
-    classnames = get_classnames('openai')
+    classnames = get_classnames('openai') if 'ImageNet' in args.dataset else dataset.classnames
 
     with torch.no_grad():
         acc, sim, n = 0., 0., 0.
@@ -435,14 +440,16 @@ def evaluate_accuracy(model, text_sim_model, dataset, template_list, args):
             y = data['labels'].to(device)
             
             n += len(x)
-            ground_truth = [classnames[yi] for yi in y]
+            
             # classify
             pred = classify_batch(model, x, template_list)
 
             # evaluate accuracy
-            sim += sum([sentence_similarity(text_sim_model, pred[i], ground_truth[i]) for i in range(len(pred))])
-            print(f"Accuracy: {(sim / n)*100}%, batch: {i+1}/{len(dataloader)}")
+            y = [classnames[yi] for yi in y]
             
+            sim += sum([sentence_similarity(text_sim_model, pred[i], y[i]) for i in range(len(pred))])
+            print(f"Accuracy: {(sim / n)*100}%, batch: {i+1}/{len(dataloader)}")
+
             '''if (end-start) > 43200:
                 print(f"Time: {end-start}")
                 print(f"terminated at batch: {i+1}/{len(dataloader)}")
@@ -462,26 +469,26 @@ def sentence_similarity(text_sim_model, predicted, ground_truth):
     return similarity_score.item()
 
 def classify_batch(model, images, template_list):
-    x = [torch.clamp(xi, 0, 1) for xi in images]
-    x = [T.ToPILImage()(xi) for xi in x]
-    processed_images = model._old_processor(images=x, return_tensors="pt", padding=True)
+    #images = [torch.clamp(xi, 0, 1) for xi in images]
+    images = [T.ToPILImage()(xi) for xi in images]
+    images = model._old_processor(images=images, return_tensors="pt", padding=True)
 
     # extract z
-    outputs = model._attr_forward(processed_images, alpha=0.7)
+    outputs = model._attr_forward(images, alpha=0.7)
     labels = outputs["words"]
     templates = [labels[scores.argmax().item()] for scores in outputs["scores"]]
 
     # change text processor to incorporate z
     def text_processor(self, text, templ_list=templates, **kwargs):
         for i, pred_classes in enumerate (text):
-            text[i] = [templates[i].replace("object", c) for c in pred_classes]
+            text[i] = [templates[i].replace(str(args.convert_text), c) for c in pred_classes]
         text = sum(text, [])
         return self._old_processor(text=text, **kwargs)
 
     model.processor = text_processor.__get__(model)
 
     # extract y
-    outputs = model(processed_images, alpha=0.7)
+    outputs = model(images, alpha=0.7)
     labels = outputs["words"]
     pred = [labels[scores.argmax().item()] for scores in outputs["scores"]]
     

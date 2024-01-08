@@ -160,7 +160,7 @@ def main(args):
 
             return self._old_processor(text=formatted_text, **kwargs)
 
-        model.processor = text_processor.__get__(model)
+        cased.processor = text_processor.__get__(cased)
     elif args.use_simple_template == 0:
         print('Using no prompt')
     
