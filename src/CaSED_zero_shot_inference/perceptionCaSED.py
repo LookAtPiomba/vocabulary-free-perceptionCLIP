@@ -19,6 +19,8 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 from src.datasets.imagenet_classnames import get_classnames
 from torchvision.utils import save_image
+from flair.data import Sentence
+from flair.models import SequenceTagger
 
 
 def parse_arguments():
@@ -66,7 +68,7 @@ def parse_arguments():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=8,
+        default=64,
     )
     parser.add_argument("--workers",
                         type=int,
@@ -185,6 +187,41 @@ def parse_arguments():
     parsed_args.device = "cuda" if torch.cuda.is_available() else "cpu"
     return parsed_args
 
+def text_processor(self, text, attributes, **kwargs):
+    formatted_text = []
+    # Iterate through each index in list_a
+    for i, sublist_a in enumerate(text):
+        # Concatenate the words from sublist_a with each sublist in list_b
+        concatenated_words = [f"a photo of a {word_a}, {', '.join(attributes[i])}" for word_a in sublist_a]# if len(attributes[i])>0 else sublist_a
+        
+        # Append the result to the result_list
+        formatted_text.append(concatenated_words)
+
+    formatted_text = sum(formatted_text, [])
+    return self._old_processor(text=formatted_text, **kwargs)
+
+def extract_attributes(tagger, list_of_lists):
+    desired_pos_tags = ["JJ", "JJR", "JJS", "VBG", "VBN"]
+    filtered_words_per_sublist = []
+    tags_per_sublist = []
+
+    # Iterate through each sublist
+    for word_list in list_of_lists:
+      # Create a sentence from the list of words
+      sentence = Sentence(' '.join(word_list))
+
+      # Run POS tagging on the sentence
+      tagger(sentence)
+
+      # Filter words based on desired POS tags
+      filtered_words = [token.text for token in sentence.tokens if token.tag in desired_pos_tags]
+      tags = [token.tag for token in sentence.tokens if token.text in filtered_words]
+
+      # Append the filtered words to the result list
+      filtered_words_per_sublist.append(filtered_words)
+      tags_per_sublist.append(tags)
+
+    return filtered_words_per_sublist, tags_per_sublist
 
 def main(args):
     '''# load model
@@ -229,153 +266,85 @@ def main(args):
     attributes = [template(base_text) for template in template_list]
     print(f"template_list: {attributes}, len: {len(attributes)}")
 
+    # get POS tagger
+    tagger = SequenceTagger.load("flair/pos-english-fast").predict
+
     # get classifier
     cased = AutoModel.from_pretrained("altndrr/cased", trust_remote_code=True)
     cased = cased.cuda()
     cased._old_processor = cased.processor
+    cased.processor = text_processor.__get__(cased)
 
-    if args.infer_mode == 0:
-        # w/ y  
-        pass
+    def forward(self, images: dict, tagger=tagger, alpha: Optional[float] = None) -> torch.Tensor:
+        """Forward pass.
+        Args:
+            images (dict): Dictionary with the images. The expected keys are:
+                - pixel_values (torch.Tensor): Pixel values of the images.
+            alpha (Optional[float]): Alpha value for the interpolation.
+        """
+        alpha = alpha or self.hparams["alpha"]
 
+        # forward the images
+        images["pixel_values"] = images["pixel_values"].to(self.device)
+        images_z = self.vision_proj(self.vision_encoder(**images)[1])
+        images_z = images_z / images_z.norm(dim=-1, keepdim=True)
+        vocabularies = self.get_vocabulary(images_z=images_z)
 
-    elif args.infer_mode == 1:
-        # w/o y
-        def forward_attr(self, images: dict, vocabularies = attributes, alpha: Optional[float] = None) -> torch.Tensor:
-            """Forward pass.
-            Args:
-                images (dict): Dictionary with the images. The expected keys are:
-                    - pixel_values (torch.Tensor): Pixel values of the images.
-                alpha (Optional[float]): Alpha value for the interpolation.
-            """
-            alpha = alpha or self.hparams["alpha"]
+        # encode unfiltered words
+        unfiltered_words = sum(vocabularies, [])
+        texts_z = self._old_processor(unfiltered_words, return_tensors="pt", padding=True)
+        texts_z["input_ids"] = texts_z["input_ids"][:, :77].to(self.device)
+        texts_z["attention_mask"] = texts_z["attention_mask"][:, :77].to(self.device)
+        texts_z = self.language_encoder(**texts_z)[1]
+        texts_z = self.language_proj(texts_z)
+        texts_z = texts_z / texts_z.norm(dim=-1, keepdim=True)
 
-            # forward the images
-            images["pixel_values"] = images["pixel_values"].to(self.device)
-            images_z = self.vision_proj(self.vision_encoder(**images)[1])
-            images_z = images_z / images_z.norm(dim=-1, keepdim=True)
-            vocabularies = [vocabularies[:] for _ in range(images_z.size(0))]
+        # generate a text embedding for each image from their unfiltered words
+        unfiltered_words_per_image = [len(vocab) for vocab in vocabularies]
+        texts_z = torch.split(texts_z, unfiltered_words_per_image)
+        texts_z = torch.stack([text_z.mean(dim=0) for text_z in texts_z])
+        texts_z = texts_z / texts_z.norm(dim=-1, keepdim=True)
 
-            # encode unfiltered words
-            unfiltered_words = sum(vocabularies, [])
-            texts_z = self._old_processor(unfiltered_words, return_tensors="pt", padding=True)
-            texts_z["input_ids"] = texts_z["input_ids"][:, :77].to(self.device)
-            texts_z["attention_mask"] = texts_z["attention_mask"][:, :77].to(self.device)
-            texts_z = self.language_encoder(**texts_z)[1]
-            texts_z = self.language_proj(texts_z)
-            texts_z = texts_z / texts_z.norm(dim=-1, keepdim=True)
+        # filter the words and embed them
+        vocabularies = self.vocab_transform(vocabularies)
+        vocabularies = [vocab or ["object"] for vocab in vocabularies]
+        attributes, _ = extract_attributes(tagger, vocabularies)
+        filtered_words = vocabularies[:]
+        words = sum(vocabularies, [])
+        words_z = self.processor(filtered_words, attributes, return_tensors="pt", padding=True)
+        words_z = {k: v.to(self.device) for k, v in words_z.items()}
+        words_z = self.language_encoder(**words_z)[1]
+        words_z = self.language_proj(words_z)
+        words_z = words_z / words_z.norm(dim=-1, keepdim=True)
 
-            # generate a text embedding for each image from their unfiltered words
-            unfiltered_words_per_image = [len(vocab) for vocab in vocabularies]
-            texts_z = torch.split(texts_z, unfiltered_words_per_image)
-            texts_z = torch.stack([text_z.mean(dim=0) for text_z in texts_z])
-            texts_z = texts_z / texts_z.norm(dim=-1, keepdim=True)
+        # create a one-hot relation mask between images and words
+        words_per_image = [len(vocab) for vocab in vocabularies]
+        col_indices = torch.arange(sum(words_per_image))
+        row_indices = torch.arange(len(images_z)).repeat_interleave(torch.tensor(words_per_image))
+        mask = torch.zeros(len(images_z), sum(words_per_image), device=self.device)
+        mask[row_indices, col_indices] = 1
 
-            # filter the words and embed them
-            words = sum(vocabularies, [])
-            words_z = self._old_processor(words, return_tensors="pt", padding=True)
-            words_z = {k: v.to(self.device) for k, v in words_z.items()}
-            words_z = self.language_encoder(**words_z)[1]
-            words_z = self.language_proj(words_z)
-            words_z = words_z / words_z.norm(dim=-1, keepdim=True)
+        # get the image and text similarities
+        images_z = images_z / images_z.norm(dim=-1, keepdim=True)
+        texts_z = texts_z / texts_z.norm(dim=-1, keepdim=True)
+        words_z = words_z / words_z.norm(dim=-1, keepdim=True)
+        images_sim = self.logit_scale * images_z @ words_z.T
+        texts_sim = self.logit_scale * texts_z @ words_z.T
 
-            # create a one-hot relation mask between images and words
-            words_per_image = [len(vocab) for vocab in vocabularies]
-            col_indices = torch.arange(sum(words_per_image))
-            row_indices = torch.arange(len(images_z)).repeat_interleave(torch.tensor(words_per_image))
-            mask = torch.zeros(len(images_z), sum(words_per_image), device=self.device)
-            mask[row_indices, col_indices] = 1
+        # mask unrelated words
+        images_sim = torch.masked_fill(images_sim, mask == 0, float("-inf"))
+        texts_sim = torch.masked_fill(texts_sim, mask == 0, float("-inf"))
 
-            # get the image and text similarities
-            images_z = images_z / images_z.norm(dim=-1, keepdim=True)
-            texts_z = texts_z / texts_z.norm(dim=-1, keepdim=True)
-            words_z = words_z / words_z.norm(dim=-1, keepdim=True)
-            images_sim = self.logit_scale * images_z @ words_z.T
-            texts_sim = self.logit_scale * texts_z @ words_z.T
+        # get the image and text predictions
+        images_p = images_sim.softmax(dim=-1)
+        texts_p = texts_sim.softmax(dim=-1)
 
-            # mask unrelated words
-            images_sim = torch.masked_fill(images_sim, mask == 0, float("-inf"))
-            texts_sim = torch.masked_fill(texts_sim, mask == 0, float("-inf"))
+        # average the image and text predictions
+        samples_p = alpha * images_p + (1 - alpha) * texts_p
 
-            # get the image and text predictions
-            images_p = images_sim.softmax(dim=-1)
-            texts_p = texts_sim.softmax(dim=-1)
+        return {"scores": samples_p, "words": words, "vocabularies": vocabularies}
 
-            # average the image and text predictions
-            samples_p = alpha * images_p + (1 - alpha) * texts_p
-
-            return {"scores": samples_p, "words": words, "vocabularies": vocabularies}
-
-        def forward(self, images: dict, alpha: Optional[float] = None) -> torch.Tensor:
-            """Forward pass.
-            Args:
-                images (dict): Dictionary with the images. The expected keys are:
-                    - pixel_values (torch.Tensor): Pixel values of the images.
-                alpha (Optional[float]): Alpha value for the interpolation.
-            """
-            alpha = alpha or self.hparams["alpha"]
-
-            # forward the images
-            images["pixel_values"] = images["pixel_values"].to(self.device)
-            images_z = self.vision_proj(self.vision_encoder(**images)[1])
-            images_z = images_z / images_z.norm(dim=-1, keepdim=True)
-            vocabularies = self.get_vocabulary(images_z=images_z)
-
-            # encode unfiltered words
-            unfiltered_words = sum(vocabularies, [])
-            texts_z = self._old_processor(unfiltered_words, return_tensors="pt", padding=True)
-            texts_z["input_ids"] = texts_z["input_ids"][:, :77].to(self.device)
-            texts_z["attention_mask"] = texts_z["attention_mask"][:, :77].to(self.device)
-            texts_z = self.language_encoder(**texts_z)[1]
-            texts_z = self.language_proj(texts_z)
-            texts_z = texts_z / texts_z.norm(dim=-1, keepdim=True)
-
-            # generate a text embedding for each image from their unfiltered words
-            unfiltered_words_per_image = [len(vocab) for vocab in vocabularies]
-            texts_z = torch.split(texts_z, unfiltered_words_per_image)
-            texts_z = torch.stack([text_z.mean(dim=0) for text_z in texts_z])
-            texts_z = texts_z / texts_z.norm(dim=-1, keepdim=True)
-
-            # filter the words and embed them
-            vocabularies = self.vocab_transform(vocabularies)
-            vocabularies = [vocab or ["object"] for vocab in vocabularies]
-            filtered_words = vocabularies[:]
-            words = sum(vocabularies, [])
-            words_z = self.processor(filtered_words, return_tensors="pt", padding=True)
-            words_z = {k: v.to(self.device) for k, v in words_z.items()}
-            words_z = self.language_encoder(**words_z)[1]
-            words_z = self.language_proj(words_z)
-            words_z = words_z / words_z.norm(dim=-1, keepdim=True)
-
-            # create a one-hot relation mask between images and words
-            words_per_image = [len(vocab) for vocab in vocabularies]
-            col_indices = torch.arange(sum(words_per_image))
-            row_indices = torch.arange(len(images_z)).repeat_interleave(torch.tensor(words_per_image))
-            mask = torch.zeros(len(images_z), sum(words_per_image), device=self.device)
-            mask[row_indices, col_indices] = 1
-
-            # get the image and text similarities
-            images_z = images_z / images_z.norm(dim=-1, keepdim=True)
-            texts_z = texts_z / texts_z.norm(dim=-1, keepdim=True)
-            words_z = words_z / words_z.norm(dim=-1, keepdim=True)
-            images_sim = self.logit_scale * images_z @ words_z.T
-            texts_sim = self.logit_scale * texts_z @ words_z.T
-
-            # mask unrelated words
-            images_sim = torch.masked_fill(images_sim, mask == 0, float("-inf"))
-            texts_sim = torch.masked_fill(texts_sim, mask == 0, float("-inf"))
-
-            # get the image and text predictions
-            images_p = images_sim.softmax(dim=-1)
-            texts_p = texts_sim.softmax(dim=-1)
-
-            # average the image and text predictions
-            samples_p = alpha * images_p + (1 - alpha) * texts_p
-
-            return {"scores": samples_p, "words": words, "vocabularies": vocabularies}
-
-        cased._attr_forward = forward_attr.__get__(cased)
-        cased.forward = forward.__get__(cased)
+    cased.forward = forward.__get__(cased)
 
     # get sentence-BERT model
     sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
@@ -469,26 +438,11 @@ def sentence_similarity(text_sim_model, predicted, ground_truth):
     return similarity_score.item()
 
 def classify_batch(model, images, template_list):
-    #images = [torch.clamp(xi, 0, 1) for xi in images]
     images = [T.ToPILImage()(xi) for xi in images]
     images = model._old_processor(images=images, return_tensors="pt", padding=True)
 
-    # extract z
-    outputs = model._attr_forward(images, alpha=0.7)
-    labels = outputs["words"]
-    templates = [labels[scores.argmax().item()] for scores in outputs["scores"]]
-
-    # change text processor to incorporate z
-    def text_processor(self, text, templ_list=templates, **kwargs):
-        for i, pred_classes in enumerate (text):
-            text[i] = [templates[i].replace(str(args.convert_text), c) for c in pred_classes]
-        text = sum(text, [])
-        return self._old_processor(text=text, **kwargs)
-
-    model.processor = text_processor.__get__(model)
-
-    # extract y
-    outputs = model(images, alpha=0.7)
+    # classify
+    outputs = model(images, alpha=0.5)
     labels = outputs["words"]
     pred = [labels[scores.argmax().item()] for scores in outputs["scores"]]
     
