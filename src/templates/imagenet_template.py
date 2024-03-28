@@ -2,6 +2,10 @@ imagenet_main_template = [
     lambda c: f"a photo of a {c}"
 ]
 
+imagenet_context_template = [
+    lambda c, d: f"a photo of a {c}, {d}"
+]
+
 imagenet_factor_templates = {
     "orientation": [
         "",

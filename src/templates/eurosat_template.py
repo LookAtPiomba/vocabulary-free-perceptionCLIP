@@ -6,6 +6,10 @@ eurosat_main_template = [
     lambda c: f'a centered satellite photo of {c}',
 ]
 
+eurosat_context_template = [
+    lambda c, d: f'a centered satellite photo of {c}, {d}',
+]
+
 eurosat_factor_templates = {
     "source": [
         "",

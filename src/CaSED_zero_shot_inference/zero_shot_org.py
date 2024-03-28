@@ -1,3 +1,4 @@
+import sys
 import torch
 import argparse
 import os
@@ -133,6 +134,7 @@ def sentence_similarity(text_sim_model, predicted, ground_truth):
 
 def evaluate_accuracy(model, text_sim_model, dataset, args):
 
+    model.eval()
     dataloader = get_dataloader(dataset,
                                 is_train=args.eval_trainset,
                                 args=args,
@@ -145,7 +147,7 @@ def evaluate_accuracy(model, text_sim_model, dataset, args):
     with torch.no_grad():
         acc, sim, n = 0., 0., 0.
         for i, data in batched_data:
-            print(f"batch: {i}/{len(dataloader)}")
+            
             data = maybe_dictionarize(data)
             x = data['images'].to(device)
             y = data['labels'].to(device)
@@ -157,36 +159,35 @@ def evaluate_accuracy(model, text_sim_model, dataset, args):
                 x = transformer.augment_image(args.eval_augmentation_2, x,
                                               args.eval_augmentation_param)
 
-            for j, img in enumerate(x):
-                image_tensor = torch.clamp(img, 0, 1)
-                #permute = [2, 1, 0]
-                #image_tensor = image_tensor[:, permute]
-                image = T.ToPILImage()(image_tensor)
-                if j == 0 and i == 0:
-                    print(f'type {type(x)}')
-                    print(type(img))
-                    image.save('clamp_test.png')
-
-                logits = model._old_processor(images=[image], return_tensors="pt", padding=True)
-                outputs = model(logits, alpha=0.5)
-                labels, scores = outputs["vocabularies"][0], outputs["scores"][0]
-                max_score_index = scores.argmax().item()
-                pred = labels[max_score_index]
-                #similarity = sentence_similarity(text_sim_model, pred, classnames[y[j]])
-                #print(f'predicted: {pred}, actual: {classnames[y[j]]} --> similarity: {similarity}')
-                sim += sentence_similarity(text_sim_model, pred, classnames[y[j]])
-                #correct += 1 if pred == classnames[y[j]] else 0
-                break
             n += len(x)
+            
+            # classify
+            pred = classify_batch(model, x)
+
+            # evaluate accuracy
+            y = [classnames[yi] for yi in y]
+            
+            sim += sum([sentence_similarity(text_sim_model, pred[i], y[i]) for i in range(len(pred))])
             print(f"Accuracy: {(sim / n)*100}%, batch: {i+1}/{len(dataloader)}")
-            break
+            
         acc = sim / n
 
     return acc
 
+def classify_batch(model, images):
+    images = [T.ToPILImage()(xi) for xi in images]
+    images = model._old_processor(images=images, return_tensors="pt", padding=True)
+
+    # classify
+    outputs = model(images, alpha=0.7)
+    labels = outputs["words"]
+    pred = [labels[scores.argmax().item()] for scores in outputs["scores"]]
+    
+    return pred
+
 def main(args):
     # load model
-    model = CLIPEncoder(args, keep_lang=True)
+    '''model = CLIPEncoder(args, keep_lang=True)
     print(f"Model arch: {args.model}")
     if args.finetuned_checkpoint is not None:
         if args.checkpoint_mode == 0:
@@ -195,11 +196,17 @@ def main(args):
         elif args.checkpoint_mode == 1:
             model.load(args.finetuned_checkpoint)
         print('finetuned model loaded.')
-    model = model.cuda()
+    model = model.cuda()'''
+
+    # create image transformer
+    preprocess = T.transforms.Compose([
+        T.Resize((224, 224)),
+        T.ToTensor(),
+    ])
 
     # load data
     dataset_class = getattr(datasets, args.dataset)
-    dataset = dataset_class(model.val_preprocess,
+    dataset = dataset_class(preprocess,
                             location=args.data_location,
                             batch_size=args.batch_size,
                             num_workers=args.workers)
@@ -214,9 +221,11 @@ def main(args):
     # create classifier
     cased = AutoModel.from_pretrained("altndrr/cased", trust_remote_code=True)
     cased = cased.cuda()
-    print(cased)
 
     template = template[0] if args.template == "simple_template" else template[1]
+
+    print(template("a dog"))
+    sys.exit(0)
 
     def text_processor(self, text, templ=template, **kwargs):
         text = [templ(t) for t in text]

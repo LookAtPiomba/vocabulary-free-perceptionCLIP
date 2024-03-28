@@ -3,7 +3,9 @@
 export PYTHONPATH="$PYTHONPATH:$PWD"
 
 dataset=$1
-save_name=$2
+template=$2
+save_name=$3
 
-python  src/CaSED_zero_shot_inference/perceptionCaSED.py  --dataset="$dataset" \
+python  src/CaSED_zero_shot_inference/perceptionCaSED_one_step.py  --dataset="$dataset" \
+  --template="$template" \
   --save_name="$save_name" \

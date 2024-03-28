@@ -6,6 +6,10 @@ oxfordpets_main_template = [
     lambda c: f'a photo of a {c}, a type of pet',
 ]
 
+oxfordpets_context_template = [
+    lambda c, d: f'a photo of a {c}, a type of pet, {d}',
+]
+
 oxfordpets_factor_templates = {
     "species": [
         "",

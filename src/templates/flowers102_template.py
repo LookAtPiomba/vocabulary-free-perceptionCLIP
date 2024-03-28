@@ -6,6 +6,10 @@ flowers102_main_template = [
     lambda c: f'a photo of a {c}, a type of flower'
 ]
 
+flowers102_context_template = [
+    lambda c, d: f'a photo of a {c}, a type of flower, {d}'
+]
+
 flowers102_factor_templates = {
     "background": [
         "",

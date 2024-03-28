@@ -66,7 +66,7 @@ def parse_arguments():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=8,
+        default=1,
     )
     parser.add_argument("--workers",
                         type=int,
@@ -241,7 +241,7 @@ def main(args):
 
     elif args.infer_mode == 1:
         # w/o y
-        def forward_attr(self, images: dict, vocabularies = attributes, alpha: Optional[float] = None) -> torch.Tensor:
+        def forward_attr(self, images: dict, attributes = attributes, alpha: Optional[float] = None) -> torch.Tensor:
             """Forward pass.
             Args:
                 images (dict): Dictionary with the images. The expected keys are:
@@ -254,7 +254,8 @@ def main(args):
             images["pixel_values"] = images["pixel_values"].to(self.device)
             images_z = self.vision_proj(self.vision_encoder(**images)[1])
             images_z = images_z / images_z.norm(dim=-1, keepdim=True)
-            vocabularies = [vocabularies[:] for _ in range(images_z.size(0))]
+            attributes = [attributes[:] for _ in range(images_z.size(0))]
+            vocabularies = self.get_vocabulary(images_z=images_z)
 
             # encode unfiltered words
             unfiltered_words = sum(vocabularies, [])
@@ -272,7 +273,7 @@ def main(args):
             texts_z = texts_z / texts_z.norm(dim=-1, keepdim=True)
 
             # filter the words and embed them
-            words = sum(vocabularies, [])
+            words = sum(attributes, [])
             words_z = self._old_processor(words, return_tensors="pt", padding=True)
             words_z = {k: v.to(self.device) for k, v in words_z.items()}
             words_z = self.language_encoder(**words_z)[1]
@@ -280,7 +281,7 @@ def main(args):
             words_z = words_z / words_z.norm(dim=-1, keepdim=True)
 
             # create a one-hot relation mask between images and words
-            words_per_image = [len(vocab) for vocab in vocabularies]
+            words_per_image = [len(vocab) for vocab in attributes]
             col_indices = torch.arange(sum(words_per_image))
             row_indices = torch.arange(len(images_z)).repeat_interleave(torch.tensor(words_per_image))
             mask = torch.zeros(len(images_z), sum(words_per_image), device=self.device)
@@ -449,7 +450,6 @@ def evaluate_accuracy(model, text_sim_model, dataset, template_list, args):
             
             sim += sum([sentence_similarity(text_sim_model, pred[i], y[i]) for i in range(len(pred))])
             print(f"Accuracy: {(sim / n)*100}%, batch: {i+1}/{len(dataloader)}")
-
             '''if (end-start) > 43200:
                 print(f"Time: {end-start}")
                 print(f"terminated at batch: {i+1}/{len(dataloader)}")

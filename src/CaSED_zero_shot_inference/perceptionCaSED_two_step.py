@@ -21,6 +21,7 @@ from src.datasets.imagenet_classnames import get_classnames
 from torchvision.utils import save_image
 from flair.data import Sentence
 from flair.models import SequenceTagger
+from itertools import permutations
 
 
 def parse_arguments():
@@ -68,7 +69,7 @@ def parse_arguments():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=64,
+        default=16,
     )
     parser.add_argument("--workers",
                         type=int,
@@ -165,40 +166,27 @@ def parse_arguments():
         default=False,
         help="Evaluate group robustness",
     )
-    parser.add_argument(
-        "--factors",
-        default=None,
-        type=lambda x: x.split(","),
-    )
-    parser.add_argument(
-        "--main_template",
-        type=str,
-        default="main_template",
-        help="text prompt for Y",
-    )
-    parser.add_argument(
-        "--factor_templates",
-        type=str,
-        default="factor_templates",
-        help="text prompt for Zs",
-    )
     parsed_args = parser.parse_args()
 
     parsed_args.device = "cuda" if torch.cuda.is_available() else "cpu"
     return parsed_args
 
-def text_processor(self, text, attributes, **kwargs):
-    formatted_text = []
-    # Iterate through each index in list_a
-    for i, sublist_a in enumerate(text):
-        # Concatenate the words from sublist_a with each sublist in list_b
-        concatenated_words = [f"a photo of a {word_a}, {', '.join(attributes[i])}" for word_a in sublist_a]# if len(attributes[i])>0 else sublist_a
-        
-        # Append the result to the result_list
-        formatted_text.append(concatenated_words)
+def unique_permutations(attributes):
+    # Generate all possible permutations for each sublist
+    unique_permutations = []
 
-    formatted_text = sum(formatted_text, [])
-    return self._old_processor(text=formatted_text, **kwargs)
+    for sublist in attributes:
+        sublist_permutations = set()
+
+        # Iterate over different lengths
+        for r in range(1, len(sublist) + 1):
+            # Generate permutations of length r, sort each permutation
+            permutations_r = set(tuple(sorted(perm)) for perm in permutations(sublist, r))
+            sublist_permutations.update(permutations_r)
+
+        unique_permutations.append(list(sublist_permutations))
+    
+    return unique_permutations
 
 def extract_attributes(tagger, list_of_lists):
     desired_pos_tags = ["JJ", "JJR", "JJS", "VBG", "VBN"]
@@ -252,30 +240,29 @@ def main(args):
 
     #model = None
 
-    # load template
-    if args.factors is not None:
-        main_template = getattr(templates, args.main_template)
-        factor_templates = getattr(templates, args.factor_templates)
-        template_list = compose_template(main_template, factor_templates, args.factors)
-    else:
-        template_list = getattr(templates,
-                            args.template)  # todo: here, we only consider the case where one factor value has only one text description. Need to extendent to multiple descriptions.'''
-
-    print(f"infer_mode: {args.infer_mode}")
+    template_list = getattr(templates, args.template)
+    template = template_list[0]
     base_text = args.convert_text
-    attributes = [template(base_text) for template in template_list]
-    print(f"template_list: {attributes}, len: {len(attributes)}")
-
+    print(template(base_text, "context"))
+    # TODO: use template in text_processor
     # get POS tagger
     tagger = SequenceTagger.load("flair/pos-english-fast").predict
+    tagger.cuda()
 
     # get classifier
     cased = AutoModel.from_pretrained("altndrr/cased", trust_remote_code=True)
     cased = cased.cuda()
     cased._old_processor = cased.processor
-    cased.processor = text_processor.__get__(cased)
 
-    def forward(self, images: dict, tagger=tagger, alpha: Optional[float] = None) -> torch.Tensor:
+    def attr_text_processor(self, text, templ = template, base_text = base_text, **kwargs):
+        for i, attr in enumerate (text):
+            text[i] = [template(base_text, a) for a in attr]
+        text = sum(text, [])
+        return self._old_processor(text=text, **kwargs)
+    
+    cased._attr_processor = attr_text_processor.__get__(cased)
+
+    def forward_attr(self, images: dict, tagger=tagger, alpha: Optional[float] = None) -> torch.Tensor:
         """Forward pass.
         Args:
             images (dict): Dictionary with the images. The expected keys are:
@@ -308,10 +295,79 @@ def main(args):
         # filter the words and embed them
         vocabularies = self.vocab_transform(vocabularies)
         vocabularies = [vocab or ["object"] for vocab in vocabularies]
-        attributes, _ = extract_attributes(tagger, vocabularies)
+        attributes, _ = extract_attributes(tagger, vocabularies.cuda())
+        attributes = unique_permutations(attributes)
+        filtered_attrs = attributes[:]
+        words = sum(attributes, [])
+        words_z = self._attr_processor(filtered_attrs, return_tensors="pt", padding=True)
+        words_z = {k: v.to(self.device) for k, v in words_z.items()}
+        words_z = self.language_encoder(**words_z)[1]
+        words_z = self.language_proj(words_z)
+        words_z = words_z / words_z.norm(dim=-1, keepdim=True)
+
+        # create a one-hot relation mask between images and words
+        words_per_image = [len(vocab) for vocab in attributes]
+        col_indices = torch.arange(sum(words_per_image))
+        row_indices = torch.arange(len(images_z)).repeat_interleave(torch.tensor(words_per_image))
+        mask = torch.zeros(len(images_z), sum(words_per_image), device=self.device)
+        mask[row_indices, col_indices] = 1
+
+        # get the image and text similarities
+        images_z = images_z / images_z.norm(dim=-1, keepdim=True)
+        texts_z = texts_z / texts_z.norm(dim=-1, keepdim=True)
+        words_z = words_z / words_z.norm(dim=-1, keepdim=True)
+        images_sim = self.logit_scale * images_z @ words_z.T
+        texts_sim = self.logit_scale * texts_z @ words_z.T
+
+        # mask unrelated words
+        images_sim = torch.masked_fill(images_sim, mask == 0, float("-inf"))
+        texts_sim = torch.masked_fill(texts_sim, mask == 0, float("-inf"))
+
+        # get the image and text predictions
+        images_p = images_sim.softmax(dim=-1)
+        texts_p = texts_sim.softmax(dim=-1)
+
+        # average the image and text predictions
+        samples_p = alpha * images_p + (1 - alpha) * texts_p
+
+        return {"scores": samples_p, "words": words, "vocabularies": vocabularies}
+
+    def forward(self, images: dict, alpha: Optional[float] = None) -> torch.Tensor:
+        """Forward pass.
+        Args:
+            images (dict): Dictionary with the images. The expected keys are:
+                - pixel_values (torch.Tensor): Pixel values of the images.
+            alpha (Optional[float]): Alpha value for the interpolation.
+        """
+        alpha = alpha or self.hparams["alpha"]
+
+        # forward the images
+        images["pixel_values"] = images["pixel_values"].to(self.device)
+        images_z = self.vision_proj(self.vision_encoder(**images)[1])
+        images_z = images_z / images_z.norm(dim=-1, keepdim=True)
+        vocabularies = self.get_vocabulary(images_z=images_z)
+
+        # encode unfiltered words
+        unfiltered_words = sum(vocabularies, [])
+        texts_z = self._old_processor(unfiltered_words, return_tensors="pt", padding=True)
+        texts_z["input_ids"] = texts_z["input_ids"][:, :77].to(self.device)
+        texts_z["attention_mask"] = texts_z["attention_mask"][:, :77].to(self.device)
+        texts_z = self.language_encoder(**texts_z)[1]
+        texts_z = self.language_proj(texts_z)
+        texts_z = texts_z / texts_z.norm(dim=-1, keepdim=True)
+
+        # generate a text embedding for each image from their unfiltered words
+        unfiltered_words_per_image = [len(vocab) for vocab in vocabularies]
+        texts_z = torch.split(texts_z, unfiltered_words_per_image)
+        texts_z = torch.stack([text_z.mean(dim=0) for text_z in texts_z])
+        texts_z = texts_z / texts_z.norm(dim=-1, keepdim=True)
+
+        # filter the words and embed them
+        vocabularies = self.vocab_transform(vocabularies)
+        vocabularies = [vocab or ["object"] for vocab in vocabularies]
         filtered_words = vocabularies[:]
         words = sum(vocabularies, [])
-        words_z = self.processor(filtered_words, attributes, return_tensors="pt", padding=True)
+        words_z = self.processor(filtered_words, return_tensors="pt", padding=True)
         words_z = {k: v.to(self.device) for k, v in words_z.items()}
         words_z = self.language_encoder(**words_z)[1]
         words_z = self.language_proj(words_z)
@@ -344,6 +400,7 @@ def main(args):
 
         return {"scores": samples_p, "words": words, "vocabularies": vocabularies}
 
+    cased._attr_forward = forward_attr.__get__(cased)
     cased.forward = forward.__get__(cased)
 
     # get sentence-BERT model
@@ -355,7 +412,7 @@ def main(args):
         pass
     else:
         #acc = classify(model, classification_head, dataset, args, factor_head)
-        acc = evaluate_accuracy(cased, sbert_model, dataset, template_list, args)
+        acc = evaluate_accuracy(cased, sbert_model, dataset, template, args)
 
     print(f"Avg accuracy: {acc}")
 
@@ -364,30 +421,13 @@ def main(args):
         os.makedirs(args.save_path)
     file_path = os.path.join(args.save_path, args.save_name + '.csv')
     with open(file_path, mode='a') as file:
-        writer = csv.writer(file)
-        if args.eval_augmentation_2 != "None":
-            writer.writerow(
-                [args.eval_augmentation] + [args.eval_augmentation_2] + [acc])
-        elif args.eval_augmentation != "None":
-            writer.writerow([args.eval_augmentation] + [acc])
-        else:
-            if args.eval_group:
-                pass
-                '''if args.factors is not None:
-                    writer.writerow([args.factors] + [acc] + [worst])
-                else:
-                    writer.writerow([args.template] + [acc] + [worst])'''
-            else:
-                if args.factors is not None:
-                    writer.writerow([args.factors] + [acc])
-                else:
-                    writer.writerow([args.template] + [acc])
-
+        writer = csv.writer(file)        
+        writer.writerow([args.dataset] + [acc])
     print('results saved!')
 
     return
 
-def evaluate_accuracy(model, text_sim_model, dataset, template_list, args):
+def evaluate_accuracy(model, text_sim_model, dataset, template, args):
 
     model.eval()
     dataloader = get_dataloader(dataset,
@@ -411,7 +451,7 @@ def evaluate_accuracy(model, text_sim_model, dataset, template_list, args):
             n += len(x)
             
             # classify
-            pred = classify_batch(model, x, template_list)
+            pred = classify_batch(model, x, template)
 
             # evaluate accuracy
             y = [classnames[yi] for yi in y]
@@ -423,6 +463,7 @@ def evaluate_accuracy(model, text_sim_model, dataset, template_list, args):
                 print(f"Time: {end-start}")
                 print(f"terminated at batch: {i+1}/{len(dataloader)}")
                 break'''
+            break
         end = time.time()
         print(f"Time: {(end-start)/60} minutes")
         acc = sim / n
@@ -437,12 +478,26 @@ def sentence_similarity(text_sim_model, predicted, ground_truth):
 
     return similarity_score.item()
 
-def classify_batch(model, images, template_list):
+def classify_batch(model, images, template):
     images = [T.ToPILImage()(xi) for xi in images]
     images = model._old_processor(images=images, return_tensors="pt", padding=True)
 
+    # extract z_hat
+    outputs = model._attr_forward(images, alpha=0.7)
+    labels = outputs["words"]
+    z_hats = [labels[scores.argmax().item()] for scores in outputs["scores"]]
+
+    # change text processor to incorporate z
+    def text_processor(self, text, template = template, attributes = z_hats, **kwargs):
+        for i, pred_classes in enumerate (text):
+            text[i] = [template(c, attributes[i]) for c in pred_classes]
+        text = sum(text, [])
+        return self._old_processor(text=text, **kwargs)
+
+    model.processor = text_processor.__get__(model)
+
     # classify
-    outputs = model(images, alpha=0.5)
+    outputs = model(images, alpha=0.7)
     labels = outputs["words"]
     pred = [labels[scores.argmax().item()] for scores in outputs["scores"]]
     
