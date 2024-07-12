@@ -22,6 +22,9 @@ from torchvision.utils import save_image
 from flair.data import Sentence
 from flair.models import SequenceTagger
 from itertools import permutations
+import clip
+from src.metrics.semantic_iou import SentenceIOU
+from src.metrics.clustering import SemanticClusterAccuracy
 
 
 def parse_arguments():
@@ -69,7 +72,7 @@ def parse_arguments():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=16,
+        default=8,
     )
     parser.add_argument("--workers",
                         type=int,
@@ -166,6 +169,12 @@ def parse_arguments():
         default=False,
         help="Evaluate group robustness",
     )
+    parser.add_argument(
+        "--metric",
+        type=str,
+        default="semantic_similarity",
+        help="metric for evaluating the performance",
+    )
     parsed_args = parser.parse_args()
 
     parsed_args.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -247,7 +256,7 @@ def main(args):
     # TODO: use template in text_processor
     # get POS tagger
     tagger = SequenceTagger.load("flair/pos-english-fast").predict
-    tagger.cuda()
+    #tagger.cuda()
 
     # get classifier
     cased = AutoModel.from_pretrained("altndrr/cased", trust_remote_code=True)
@@ -295,7 +304,7 @@ def main(args):
         # filter the words and embed them
         vocabularies = self.vocab_transform(vocabularies)
         vocabularies = [vocab or ["object"] for vocab in vocabularies]
-        attributes, _ = extract_attributes(tagger, vocabularies.cuda())
+        attributes, _ = extract_attributes(tagger, vocabularies)
         attributes = unique_permutations(attributes)
         filtered_attrs = attributes[:]
         words = sum(attributes, [])
@@ -404,8 +413,11 @@ def main(args):
     cased.forward = forward.__get__(cased)
 
     # get sentence-BERT model
-    sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
-    sbert_model.cuda()
+    sbert_model = None
+    if args.metric == "semantic_similarity":
+        # get sentence-BERT model
+        sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
+        sbert_model.cuda()
 
     if args.eval_group:
         #acc, worst, _ = classify(model, classification_head, dataset, args, factor_head)
@@ -439,6 +451,13 @@ def evaluate_accuracy(model, text_sim_model, dataset, template, args):
 
     classnames = get_classnames('openai') if 'ImageNet' in args.dataset else dataset.classnames
 
+    if args.metric == "semantic_similarity":
+        pass
+    elif args.metric == "semantic_iou":
+        semantic_iou = SentenceIOU()
+    elif args.metric == "clustering_accuracy":
+        clustering_accuracy = SemanticClusterAccuracy()
+
     with torch.no_grad():
         acc, sim, n = 0., 0., 0.
         start = time.time()
@@ -456,14 +475,23 @@ def evaluate_accuracy(model, text_sim_model, dataset, template, args):
             # evaluate accuracy
             y = [classnames[yi] for yi in y]
             
-            sim += sum([sentence_similarity(text_sim_model, pred[i], y[i]) for i in range(len(pred))])
-            print(f"Accuracy: {(sim / n)*100}%, batch: {i+1}/{len(dataloader)}")
+            if args.metric == "semantic_similarity":
+                sim += sum([sentence_similarity(text_sim_model, pred[i], y[i]) for i in range(len(pred))])
+                print(f"Accuracy: {(sim / n)*100}%, batch: {i+1}/{len(dataloader)}")
 
-            '''if (end-start) > 43200:
-                print(f"Time: {end-start}")
-                print(f"terminated at batch: {i+1}/{len(dataloader)}")
-                break'''
-            break
+            elif args.metric == "semantic_iou":
+                #sim += sum([semantic_iou(pred[i], y[i]) for i in range(len(pred))])
+                semantic_iou.update(pred, y)
+                sim += semantic_iou.compute().item()
+                print(f"Accuracy: {(sim/(i+1))*100}%, batch: {i+1}/{len(dataloader)}")
+            elif args.metric == "clustering_accuracy":
+                clustering_accuracy.update(pred, y)
+                sim += clustering_accuracy.compute().item()
+                print(f"Accuracy: {(sim/(i+1))*100}%, batch: {i+1}/{len(dataloader)}")
+                
+            else:
+                raise ValueError(f"Unknown metric: {args.metric}")
+            
         end = time.time()
         print(f"Time: {(end-start)/60} minutes")
         acc = sim / n

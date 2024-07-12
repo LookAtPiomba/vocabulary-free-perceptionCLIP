@@ -21,7 +21,8 @@ from src.datasets.imagenet_classnames import get_classnames
 from torchvision.utils import save_image
 from flair.data import Sentence
 from flair.models import SequenceTagger
-
+from src.metrics.semantic_iou import SentenceIOU
+from src.metrics.clustering import SemanticClusterAccuracy
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
@@ -164,6 +165,12 @@ def parse_arguments():
         type=bool,
         default=False,
         help="Evaluate group robustness",
+    )
+    parser.add_argument(
+        "--metric",
+        type=str,
+        default="semantic_similarity",
+        help="metric for evaluating the performance",
     )
     parsed_args = parser.parse_args()
 
@@ -321,8 +328,11 @@ def main(args):
     cased.forward = forward.__get__(cased)
 
     # get sentence-BERT model
-    sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
-    sbert_model.cuda()
+    sbert_model = None
+    if args.metric == "semantic_similarity":
+        # get sentence-BERT model
+        sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
+        sbert_model.cuda()
 
     if args.eval_group:
         #acc, worst, _ = classify(model, classification_head, dataset, args, factor_head)
@@ -336,7 +346,7 @@ def main(args):
     # save result to csv
     if not os.path.exists(args.save_path):
         os.makedirs(args.save_path)
-    file_path = os.path.join(args.save_path, args.save_name + '.csv')
+    file_path = os.path.join(args.save_path, args.save_name + "_" + args.metric + '.csv')
     with open(file_path, mode='a') as file:
         writer = csv.writer(file)        
         writer.writerow([args.dataset] + [acc])
@@ -356,6 +366,13 @@ def evaluate_accuracy(model, text_sim_model, dataset, template_list, args):
 
     classnames = get_classnames('openai') if 'ImageNet' in args.dataset else dataset.classnames
 
+    if args.metric == "semantic_similarity":
+        pass
+    elif args.metric == "semantic_iou":
+        semantic_iou = SentenceIOU()
+    elif args.metric == "clustering_accuracy":
+        clustering_accuracy = SemanticClusterAccuracy()
+
     with torch.no_grad():
         acc, sim, n = 0., 0., 0.
         start = time.time()
@@ -373,16 +390,29 @@ def evaluate_accuracy(model, text_sim_model, dataset, template_list, args):
             # evaluate accuracy
             y = [classnames[yi] for yi in y]
             
-            sim += sum([sentence_similarity(text_sim_model, pred[i], y[i]) for i in range(len(pred))])
-            print(f"Accuracy: {(sim / n)*100}%, batch: {i+1}/{len(dataloader)}")
+            if args.metric == "semantic_similarity":
+                sim += sum([sentence_similarity(text_sim_model, pred[i], y[i]) for i in range(len(pred))])
+                print(f"Accuracy: {(sim / n)*100}%, batch: {i+1}/{len(dataloader)}")
 
-            '''if (end-start) > 43200:
-                print(f"Time: {end-start}")
-                print(f"terminated at batch: {i+1}/{len(dataloader)}")
-                break'''
+            elif args.metric == "semantic_iou":
+                #sim += sum([semantic_iou(pred[i], y[i]) for i in range(len(pred))])
+                semantic_iou.update(pred, y)
+                sim += semantic_iou.compute().item()
+                print(f"Accuracy: {(sim/(i+1))*100}%, batch: {i+1}/{len(dataloader)}")
+            elif args.metric == "clustering_accuracy":
+                clustering_accuracy.update(pred, y)
+                sim += clustering_accuracy.compute().item()
+                print(f"Accuracy: {(sim/(i+1))*100}%, batch: {i+1}/{len(dataloader)}")
+                
+            else:
+                raise ValueError(f"Unknown metric: {args.metric}")
+
         end = time.time()
         print(f"Time: {(end-start)/60} minutes")
-        acc = sim / n
+        if args.metric == "semantic_similarity":
+            acc = sim / n
+        else:
+            acc = sim / len(dataloader)
     return acc
 
 def sentence_similarity(text_sim_model, predicted, ground_truth):

@@ -17,6 +17,8 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 from src.datasets.imagenet_classnames import get_classnames
 from torchvision.utils import save_image
+from src.metrics.semantic_iou import SentenceIOU
+from src.metrics.clustering import SemanticClusterAccuracy
 
 
 def parse_arguments():
@@ -58,7 +60,7 @@ def parse_arguments():
     parser.add_argument(
         "--model",
         type=str,
-        default="ViT-B/32",
+        default="ViT-L/14",
         help="The type of model (e.g. RN50, ViT-B/32).",
     )
     parser.add_argument(
@@ -161,25 +163,18 @@ def parse_arguments():
         default=False,
         help="Evaluate group robustness",
     )
+    parser.add_argument(
+        "--metric",
+        type=str,
+        default="semantic_similarity",
+        help="metric for evaluating the performance",
+    )
     parsed_args = parser.parse_args()
 
     parsed_args.device = "cuda" if torch.cuda.is_available() else "cpu"
     return parsed_args
 
-
-def main(args):
-    # load model
-    '''model = CLIPEncoder(args, keep_lang=True)
-    print(f"Model arch: {args.model}")
-    if args.finetuned_checkpoint is not None:
-        if args.checkpoint_mode == 0:
-            finetuned_checkpoint = torch.load(args.finetuned_checkpoint)
-            model.load_state_dict(finetuned_checkpoint['model_state_dict'])
-        elif args.checkpoint_mode == 1:
-            model.load(args.finetuned_checkpoint)
-        print('finetuned model loaded.')
-    #model = model.cuda()'''
-        
+def main(args):        
     # create image transformer
     preprocess = T.transforms.Compose([
         T.Resize((224, 224)),
@@ -218,10 +213,11 @@ def main(args):
 
         cased.processor = text_processor.__get__(cased)
 
-
-    # get sentence-BERT model
-    sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
-    sbert_model.cuda()
+    sbert_model = None
+    if args.metric == "semantic_similarity":
+        # get sentence-BERT model
+        sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
+        sbert_model.cuda()
 
     if args.eval_group:
         #acc, worst, _ = classify(model, classification_head, dataset, args, factor_head)
@@ -235,7 +231,7 @@ def main(args):
     # save result to csv
     if not os.path.exists(args.save_path):
         os.makedirs(args.save_path)
-    file_path = os.path.join(args.save_path, args.save_name + '.csv')
+    file_path = os.path.join(args.save_path, args.save_name + "_" + args.metric + '.csv')
     with open(file_path, mode='a') as file:
         writer = csv.writer(file)
         if args.eval_augmentation_2 != "None":
@@ -265,6 +261,13 @@ def evaluate_accuracy(model, text_sim_model, dataset, args):
 
     classnames = get_classnames('openai') if 'ImageNet' in args.dataset else dataset.classnames
 
+    if args.metric == "semantic_similarity":
+        pass
+    elif args.metric == "semantic_iou":
+        semantic_iou = SentenceIOU()
+    elif args.metric == "clustering_accuracy":
+        clustering_accuracy = SemanticClusterAccuracy()
+
     with torch.no_grad():
         acc, sim, n = 0., 0., 0.
         start = time.time()
@@ -281,12 +284,30 @@ def evaluate_accuracy(model, text_sim_model, dataset, args):
 
             # evaluate accuracy
             y = [classnames[yi] for yi in y]          
-            sim += sum([sentence_similarity(text_sim_model, pred[i], y[i]) for i in range(len(pred))])
-            print(f"Accuracy: {(sim / n)*100}%, batch: {i+1}/{len(dataloader)}")
+            
+            if args.metric == "semantic_similarity":
+                sim += sum([sentence_similarity(text_sim_model, pred[i], y[i]) for i in range(len(pred))])
+                print(f"Accuracy: {(sim / n)*100}%, batch: {i+1}/{len(dataloader)}")
 
+            elif args.metric == "semantic_iou":
+                #sim += sum([semantic_iou(pred[i], y[i]) for i in range(len(pred))])
+                semantic_iou.update(pred, y)
+                sim += semantic_iou.compute().item()
+                print(f"Accuracy: {(sim/(i+1))*100}%, batch: {i+1}/{len(dataloader)}")
+            elif args.metric == "clustering_accuracy":
+                clustering_accuracy.update(pred, y)
+                sim += clustering_accuracy.compute().item()
+                print(f"Accuracy: {(sim/(i+1))*100}%, batch: {i+1}/{len(dataloader)}")
+                
+            else:
+                raise ValueError(f"Unknown metric: {args.metric}")
+            
         end = time.time()
         print(f"Time: {(end-start)/60} minutes")
-        acc = sim / n
+        if args.metric == "semantic_similarity":
+            acc = sim / n
+        else:
+            acc = sim / len(dataloader)
     return acc
 
 def sentence_similarity(text_sim_model, predicted, ground_truth):
@@ -297,6 +318,19 @@ def sentence_similarity(text_sim_model, predicted, ground_truth):
     similarity_score = util.pytorch_cos_sim(predicted_embeddings, ground_truth_embeddings)
 
     return similarity_score.item()
+
+def semantic_iou(predicted, ground_truth):
+
+    predicted = "".join([c for c in predicted if c.isalnum() or c == " "]).lower()
+    ground_truth = "".join([c for c in ground_truth if c.isalnum() or c == " "]).lower()
+
+    predicted = predicted.split()
+    ground_truth = ground_truth.split()
+
+    intersection = len(list(set(predicted) & set(ground_truth)))
+    union = len(list(set(predicted) | set(ground_truth)))
+
+    return intersection / union
 
 def classify_batch(model, images):
     '''images = [torch.clamp(xi, 0, 1) for xi in images]'''
