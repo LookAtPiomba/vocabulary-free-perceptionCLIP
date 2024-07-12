@@ -3,6 +3,7 @@ scripts_internal
 replicate_runs_internal
 datasets
 slurm*
+/Meta-Llama-3-8B-Instruct
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
