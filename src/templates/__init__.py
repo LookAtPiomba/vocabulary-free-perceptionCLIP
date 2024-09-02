@@ -10,3 +10,7 @@ from .food101_template import *
 from .places365_template import *
 from .flowers102_template import *
 from .eurosat_template import *
+from .sun397_template import *
+from .fgvcaircraft_template import *
+from .dtd_template import *
+from .caltech_template import *

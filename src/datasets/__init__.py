@@ -12,3 +12,8 @@ from .eurosat import EuroSAT
 from .food101 import Food101
 from .oxfordpets import OxfordPets
 from .places365 import Places365
+from .caltech101 import Caltech101
+from .dtd import DTD
+from .FGVCAircraft import FGVCAircraft
+from .stanfordcars import StanfordCars
+from .sun397 import Sun397

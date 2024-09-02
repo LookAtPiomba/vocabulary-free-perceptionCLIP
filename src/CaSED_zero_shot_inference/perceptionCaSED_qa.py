@@ -390,7 +390,7 @@ def evaluate_accuracy(model, text_sim_model, dataset, template_list, args):
         acc, sim, n = 0., 0., 0.
         start = time.time()
         for i, data in batched_data:
-            
+
             data = maybe_dictionarize(data)
             x = data['images'].to(device)
             y = data['labels'].to(device)

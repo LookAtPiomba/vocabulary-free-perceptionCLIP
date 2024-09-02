@@ -2,6 +2,7 @@
 scripts_internal
 replicate_runs_internal
 datasets
+!/src/datasets
 slurm*
 /Meta-Llama-3-8B-Instruct
 
